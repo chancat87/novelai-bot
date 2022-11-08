@@ -1,131 +1,15 @@
-import { Context, Dict, Logger, Quester, Schema, segment, Session, Time, trimSlash } from 'koishi'
+import { Context, Dict, Logger, omit, Quester, segment, Session, trimSlash } from 'koishi'
+import { Config, modelMap, models, orientMap, parseForbidden, parseInput, sampler } from './config'
 import { StableDiffusionWebUI } from './types'
-import { download, getImageSize, login, NetworkError, project, resizeInput } from './utils'
+import { closestMultiple, download, getImageSize, login, NetworkError, project, resizeInput, Size, stripDataPrefix } from './utils'
 import {} from '@koishijs/plugin-help'
+
+export * from './config'
 
 export const reactive = true
 export const name = 'novelai'
 
 const logger = new Logger('novelai')
-
-const modelMap = {
-  safe: 'safe-diffusion',
-  nai: 'nai-diffusion',
-  furry: 'nai-diffusion-furry',
-} as const
-
-const orientMap = {
-  landscape: { height: 512, width: 768 },
-  portrait: { height: 768, width: 512 },
-  square: { height: 640, width: 640 },
-} as const
-
-const lowQuality = [
-  'nsfw, text, cropped, jpeg artifacts, signature, watermark, username, blurry',
-  'lowres, polar lores, worst quality, low quality, normal quality',
-].join(', ')
-
-const badAnatomy = [
-  'bad anatomy, error, long neck, cross-eyed, mutation, deformed',
-  'bad hands, bad feet, malformed limbs, fused fingers, mutated hands',
-  'missing fingers, fewer digits, to many fingers, extra fingers, extra digit, extra limbs, extra arms, extra legs',
-  'poorly drawn hands, poorly drawn face, poorly drawn limbs',
-].join(', ')
-
-type Model = keyof typeof modelMap
-type Orient = keyof typeof orientMap
-type Sampler = typeof samplers[number]
-
-const models = Object.keys(modelMap) as Model[]
-const orients = Object.keys(orientMap) as Orient[]
-const samplers = ['k_euler_ancestral', 'k_euler', 'k_lms', 'plms', 'ddim'] as const
-
-export interface Config {
-  type: 'token' | 'login' | 'naifu' | 'sd-webui'
-  token: string
-  email: string
-  password: string
-  model?: Model
-  orient?: Orient
-  sampler?: Sampler
-  anatomy?: boolean
-  output?: 'minimal' | 'default' | 'verbose'
-  allowAnlas?: boolean | number
-  basePrompt?: string
-  negativePrompt?: string
-  forbidden?: string
-  endpoint?: string
-  headers?: Dict<string>
-  maxRetryCount?: number
-  requestTimeout?: number
-  recallTimeout?: number
-  maxConcurrency?: number
-}
-
-export const Config = Schema.intersect([
-  Schema.object({
-    type: Schema.union([
-      Schema.const('token' as const).description('授权令牌'),
-      ...process.env.KOISHI_ENV === 'browser' ? [] : [Schema.const('login' as const).description('账号密码')],
-      Schema.const('naifu' as const).description('naifu'),
-      Schema.const('sd-webui' as const).description('sd-webui'),
-    ] as const).description('登录方式'),
-  }).description('登录设置'),
-  Schema.union([
-    Schema.object({
-      type: Schema.const('token' as const),
-      token: Schema.string().description('授权令牌。').role('secret').required(),
-      endpoint: Schema.string().description('API 服务器地址。').default('https://api.novelai.net'),
-      headers: Schema.dict(String).description('要附加的额外请求头。').default({
-        'referer': 'https://novelai.net/',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36',
-      }),
-    }),
-    Schema.object({
-      type: Schema.const('login' as const),
-      email: Schema.string().description('用户名。').required(),
-      password: Schema.string().description('密码。').role('secret').required(),
-      endpoint: Schema.string().description('API 服务器地址。').default('https://api.novelai.net'),
-      headers: Schema.dict(String).description('要附加的额外请求头。').default({
-        'referer': 'https://novelai.net/',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36',
-      }),
-    }),
-    Schema.object({
-      type: Schema.const('naifu' as const),
-      token: Schema.string().description('授权令牌。').role('secret'),
-      endpoint: Schema.string().description('API 服务器地址。').required(),
-      headers: Schema.dict(String).description('要附加的额外请求头。'),
-    }),
-    Schema.object({
-      type: Schema.const('sd-webui' as const),
-      endpoint: Schema.string().description('API 服务器地址。').required(),
-    }),
-  ] as const),
-  Schema.object({
-    model: Schema.union(models).description('默认的生成模型。').default('nai'),
-    orient: Schema.union(orients).description('默认的图片方向。').default('portrait'),
-    sampler: Schema.union(samplers).description('默认的采样器。').default('k_euler_ancestral'),
-    anatomy: Schema.boolean().default(true).description('是否过滤不合理构图。'),
-    output: Schema.union([
-      Schema.const('minimal' as const).description('只发送图片'),
-      Schema.const('default' as const).description('发送图片和关键信息'),
-      Schema.const('verbose' as const).description('发送全部信息'),
-    ]).description('输出方式。').default('default'),
-    allowAnlas: Schema.union([
-      Schema.const(true).description('允许'),
-      Schema.const(false).description('禁止'),
-      Schema.natural().description('权限等级').default(1),
-    ]).default(true).description('是否允许使用点数。禁用后部分功能 (图片增强和手动设置某些参数) 将无法使用。'),
-    basePrompt: Schema.string().role('textarea').description('默认附加的标签。').default('masterpiece, best quality'),
-    negativePrompt: Schema.string().role('textarea').description('默认附加的反向标签。').default([lowQuality, badAnatomy].join(', ')),
-    forbidden: Schema.string().role('textarea').description('违禁词列表。含有违禁词的请求将被拒绝。').default(''),
-    maxRetryCount: Schema.natural().description('连接失败时最大的重试次数。').default(3),
-    requestTimeout: Schema.number().role('time').description('当请求超过这个时间时会中止并提示超时。').default(Time.minute),
-    recallTimeout: Schema.number().role('time').description('图片发送后自动撤回的时间 (设置为 0 以禁用此功能)。').default(0),
-    maxConcurrency: Schema.number().description('单个频道下的最大并发数量 (设置为 0 以禁用此功能)。').default(0),
-  }).description('功能设置'),
-] as const) as Schema<Config>
 
 function handleError(session: Session, err: Error) {
   if (Quester.isAxiosError(err)) {
@@ -159,29 +43,41 @@ export function apply(ctx: Context, config: Config) {
   const globalTasks = new Set<string>()
 
   ctx.accept(['forbidden'], (config) => {
-    forbidden = config.forbidden.trim()
-      .toLowerCase()
-      .replace(/，/g, ',')
-      .split(/(?:,\s*|\s*\n\s*)/g)
-      .filter(Boolean)
-      .map((pattern: string) => {
-        const strict = pattern.endsWith('!')
-        if (strict) pattern = pattern.slice(0, -1)
-        pattern = pattern.replace(/[^a-z0-9]+/g, ' ').trim()
-        return { pattern, strict }
-      })
+    forbidden = parseForbidden(config.forbidden)
   }, { immediate: true })
 
   let tokenTask: Promise<string> = null
   const getToken = () => tokenTask ||= login(ctx)
   ctx.accept(['token', 'type', 'email', 'password'], () => tokenTask = null)
 
-  const hidden = (session: Session<'authority'>) => {
+  const thirdParty = () => !['login', 'token'].includes(config.type)
+
+  const restricted = (session: Session<'authority'>) => {
+    if (thirdParty()) return false
     if (typeof config.allowAnlas === 'boolean') {
       return !config.allowAnlas
     } else {
       return session.user.authority < config.allowAnlas
     }
+  }
+
+  const step = (source: string) => {
+    const value = +source
+    if (value * 0 === 0 && Math.floor(value) === value && value > 0 && value <= (config.maxSteps || Infinity)) return value
+    throw new Error()
+  }
+
+  const resolution = (source: string, session: Session<'authority'>): Size => {
+    if (source in orientMap) return orientMap[source]
+    if (restricted(session)) throw new Error()
+    const cap = source.match(/^(\d+)[x×](\d+)$/)
+    if (!cap) throw new Error()
+    const width = closestMultiple(+cap[1])
+    const height = closestMultiple(+cap[2])
+    if (Math.max(width, height) > (config.maxResolution || Infinity)) {
+      throw new Error()
+    }
+    return { width, height }
   }
 
   const cmd = ctx.command('novelai <prompts:text>')
@@ -193,21 +89,22 @@ export function apply(ctx: Context, config: Config) {
     .shortcut('約稿', { fuzzy: true })
     .shortcut('增强', { fuzzy: true, options: { enhance: true } })
     .shortcut('增強', { fuzzy: true, options: { enhance: true } })
-    .option('enhance', '-e', { hidden })
-    .option('model', '-m <model>', { type: models })
-    .option('orient', '-o <orient>', { type: orients })
-    .option('sampler', '-s <sampler>', { type: samplers })
+    .option('enhance', '-e', { hidden: restricted })
+    .option('model', '-m <model>', { type: models, hidden: thirdParty })
+    .option('resolution', '-r <resolution>', { type: resolution })
+    .option('override', '-O')
+    .option('sampler', '-s <sampler>')
     .option('seed', '-x <seed:number>')
-    .option('steps', '-t <step:number>', { hidden })
+    .option('steps', '-t <step>', { type: step, hidden: restricted })
     .option('scale', '-c <scale:number>')
-    .option('noise', '-n <noise:number>', { hidden })
-    .option('strength', '-N <strength:number>', { hidden })
+    .option('noise', '-n <noise:number>', { hidden: restricted })
+    .option('strength', '-N <strength:number>', { hidden: restricted })
     .option('undesired', '-u <undesired>')
     .action(async ({ session, options }, input) => {
       if (!input?.trim()) return session.execute('help novelai')
 
       let imgUrl: string
-      if (!hidden(session)) {
+      if (!restricted(session)) {
         input = segment.transform(input, {
           image(attrs) {
             imgUrl = attrs.url
@@ -227,44 +124,8 @@ export function apply(ctx: Context, config: Config) {
         delete options.steps
       }
 
-      input = input.toLowerCase()
-        .replace(/[,，]/g, ', ')
-        .replace(/[（(]/g, '{')
-        .replace(/[)）]/g, '}')
-        .replace(/\s+/g, ' ')
-
-      if (/[^\s\w"'“”‘’.,:|()\[\]{}-]/.test(input)) {
-        return session.text('.invalid-input')
-      }
-
-      // extract negative prompts
-      const undesired = [config.negativePrompt]
-      const capture = input.match(/(,\s*|\s+)(-u\s+|negative prompts?:)\s*([\s\S]+)/m)
-      if (capture?.[3]) {
-        input = input.slice(0, capture.index).trim()
-        undesired.push(capture[3])
-      }
-
-      // remove forbidden words
-      const words = input.split(/, /g).filter((word) => {
-        word = word.replace(/[^a-z0-9]+/g, ' ').trim()
-        if (!word) return false
-        for (const { pattern, strict } of forbidden) {
-          if (strict && word.split(/\W+/g).includes(pattern)) {
-            return false
-          } else if (!strict && word.includes(pattern)) {
-            return false
-          }
-        }
-        return true
-      })
-
-      // append base prompt when input does not include it
-      for (let tag of config.basePrompt.split(/,\s*/g)) {
-        tag = tag.trim().toLowerCase()
-        if (tag && !words.includes(tag)) words.push(tag)
-      }
-      input = words.join(', ')
+      const [errPath, prompt, uc] = parseInput(input, config, forbidden, options.override)
+      if (errPath) return session.text(errPath)
 
       let token: string
       try {
@@ -278,16 +139,18 @@ export function apply(ctx: Context, config: Config) {
       }
 
       const model = modelMap[options.model]
-      const orient = orientMap[options.orient]
-      // seed can be up to 2^32
       const seed = options.seed || Math.floor(Math.random() * Math.pow(2, 32))
 
       const parameters: Dict = {
         seed,
+        prompt,
         n_samples: 1,
-        sampler: options.sampler,
-        uc: undesired.join(', '),
-        ucPreset: 0,
+        uc,
+        // 0: low quality + bad anatomy
+        // 1: low quality
+        // 2: none
+        ucPreset: 2,
+        qualityToggle: false,
       }
 
       if (imgUrl) {
@@ -302,13 +165,13 @@ export function apply(ctx: Context, config: Config) {
           return session.text('.download-error')
         }
 
-        const size = getImageSize(image[0])
         Object.assign(parameters, {
           image: image[1],
           scale: options.scale ?? 11,
           steps: options.steps ?? 50,
         })
         if (options.enhance) {
+          const size = getImageSize(image[0])
           if (size.width + size.height !== 1280) {
             return session.text('.invalid-size')
           }
@@ -319,22 +182,21 @@ export function apply(ctx: Context, config: Config) {
             strength: options.strength ?? 0.2,
           })
         } else {
-          const orient = resizeInput(size)
+          options.resolution ||= resizeInput(getImageSize(image[0]))
           Object.assign(parameters, {
-            height: orient.height,
-            width: orient.width,
+            height: options.resolution.height,
+            width: options.resolution.width,
             noise: options.noise ?? 0.2,
             strength: options.strength ?? 0.7,
           })
         }
       } else {
+        options.resolution ||= orientMap[config.orient]
         Object.assign(parameters, {
-          height: orient.height,
-          width: orient.width,
-          scale: options.scale ?? 12,
+          height: options.resolution.height,
+          width: options.resolution.width,
+          scale: options.scale ?? 11,
           steps: options.steps ?? 28,
-          noise: options.noise ?? 0.2,
-          strength: options.strength ?? 0.7,
         })
       }
 
@@ -348,8 +210,8 @@ export function apply(ctx: Context, config: Config) {
         }
       }
 
-      session.send(globalTasks.size > 1
-        ? session.text('.pending', [globalTasks.size - 1])
+      session.send(globalTasks.size
+        ? session.text('.pending', [globalTasks.size])
         : session.text('.waiting'))
 
       globalTasks.add(id)
@@ -358,7 +220,41 @@ export function apply(ctx: Context, config: Config) {
         globalTasks.delete(id)
       }
 
-      const path = config.type === 'sd-webui' ? '/sdapi/v1/txt2img' : config.type === 'naifu' ? '/generate-stream' : '/ai/generate-image'
+      const path = (() => {
+        switch (config.type) {
+          case 'sd-webui':
+            return parameters.image ? '/sdapi/v1/img2img' : '/sdapi/v1/txt2img'
+          case 'naifu':
+            return '/generate-stream'
+          default:
+            return '/ai/generate-image'
+        }
+      })()
+
+      const data = (() => {
+        if (config.type !== 'sd-webui') {
+          parameters.sampler = sampler.sd2nai(options.sampler)
+          if (config.type === 'naifu') return parameters
+          return { model, input: prompt, parameters: omit(parameters, ['prompt']) }
+        }
+
+        return {
+          sampler_index: sampler.sd[options.sampler],
+          init_images: parameters.image && [parameters.image],
+          ...project(parameters, {
+            prompt: 'prompt',
+            batch_size: 'n_samples',
+            seed: 'seed',
+            negative_prompt: 'uc',
+            cfg_scale: 'scale',
+            steps: 'steps',
+            width: 'width',
+            height: 'height',
+            denoising_strength: 'strength',
+          }),
+        }
+      })()
+
       const request = () => ctx.http.axios(trimSlash(config.endpoint) + path, {
         method: 'POST',
         timeout: config.requestTimeout,
@@ -366,27 +262,15 @@ export function apply(ctx: Context, config: Config) {
           ...config.headers,
           authorization: 'Bearer ' + token,
         },
-        data: config.type === 'sd-webui'
-          ? {
-            prompt: input,
-            ...project(parameters, {
-              n_samples: 'n_samples',
-              seed: 'seed',
-              sampler_index: 'sampler',
-              negative_prompt: 'uc',
-            }),
-          }
-          : config.type === 'naifu'
-            ? { ...parameters, prompt: input }
-            : { model, input, parameters },
+        data,
       }).then((res) => {
         if (config.type === 'sd-webui') {
-          return (res.data as StableDiffusionWebUI.Response).images[0]
+          return stripDataPrefix((res.data as StableDiffusionWebUI.Response).images[0])
         }
         // event: newImage
         // id: 1
         // data:
-        return res.data.slice(27)
+        return res.data?.slice(27)
       })
 
       let base64: string, count = 0
@@ -415,19 +299,27 @@ export function apply(ctx: Context, config: Config) {
           nickname: session.author?.nickname || session.username,
         }
         const result = segment('figure')
-        const params = [`seed = ${seed}`]
+        const lines = [`seed = ${seed}`]
         if (config.output === 'verbose') {
-          params.push(
-            `model = ${options.model}`,
+          if (!thirdParty()) {
+            lines.push(`model = ${model}`)
+          }
+          lines.push(
             `sampler = ${options.sampler}`,
-            `steps = ${options.steps}`,
-            `scale = ${options.scale}`,
+            `steps = ${parameters.steps}`,
+            `scale = ${parameters.scale}`,
           )
+          if (parameters.image) {
+            lines.push(
+              `strength = ${parameters.strength}`,
+              `noise = ${parameters.noise}`,
+            )
+          }
         }
-        result.children.push(segment('message', attrs, params.join('\n')))
-        result.children.push(segment('message', attrs, `prompt = ${input}`))
+        result.children.push(segment('message', attrs, lines.join('\n')))
+        result.children.push(segment('message', attrs, `prompt = ${prompt}`))
         if (config.output === 'verbose') {
-          result.children.push(segment('message', attrs, `undesired = ${undesired.join(', ')}`))
+          result.children.push(segment('message', attrs, `undesired = ${uc}`))
         }
         result.children.push(segment('message', attrs, segment.image('base64://' + base64)))
         return result
@@ -446,7 +338,7 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.accept(['model', 'orient', 'sampler'], (config) => {
     cmd._options.model.fallback = config.model
-    cmd._options.orient.fallback = config.orient
     cmd._options.sampler.fallback = config.sampler
+    cmd._options.sampler.type = Object.keys(config.type === 'sd-webui' ? sampler.sd : sampler.nai)
   }, { immediate: true })
 }
